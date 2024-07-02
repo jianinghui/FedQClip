@@ -12,21 +12,24 @@ import matplotlib.pyplot as plt
 import numpy as np
 from collections import defaultdict
 
-
 # 模拟伪分布式训练
 num_clients = 4
 num_rounds = 100
 num_epochs_per_round = 5
-eta_c = 0.01  # 客户端超参数，可以根据需要调整
-gamma_c = 10  # 客户端超参数，可以根据需要调整
-eta_s = 0.05  # 服务器超参数，可以根据需要调整
-gamma_s = 100  # 服务器超参数，可以根据需要调整
-quantize = False
-bit = 8
-flag = True  # 是否生成节点数据分布图
-alpha = 1.0  # 控制 Non-IID 程度的参数
-iid = False  # 是否按IID方式划分数据集
+eta_c = 0.05  
+gamma_c = 10  
+eta_s = 0.05 
+gamma_s = 1000000  
+quantize = True
+bit = 4
+flag = True  
+alpha = 1.0  
+iid = False  
 batch_size = 64
+model_name = "MobileNetV3"  # or "ResNet18"
+
+dataset_name = "TinyImagenet"  # or "CIFAR100" or "CIFAR10"
+
 
 
 class Quantizer:
@@ -41,7 +44,7 @@ class Quantizer:
             ma = x.max().item()
             mi = x.min().item()
             if ma == mi:
-                return x  # 如果最大值和最小值相等，直接返回原始值
+                return x  
             k = ((1 << self.bit) - 1) / (ma - mi)
             b = -mi * k
             x_qu = torch.round(k * x + b)
@@ -49,24 +52,23 @@ class Quantizer:
             x_qu /= k
             return x_qu
 
-# 设置随机种子
+
 def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# 设置随机种子
+
 seed = 42
 set_seed(seed)
 
-# 设置设备
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
-# 选择数据集
-dataset_name = "TinyImageNet"  # 或者 "CIFAR100"
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# 数据预处理和增强
+
+
+
 if dataset_name == "CIFAR100":
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
@@ -80,7 +82,7 @@ if dataset_name == "CIFAR100":
         transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2023, 0.1994, 0.2010]),
     ])
 
-    # 加载 CIFAR-100 数据集
+
     train_dataset = datasets.CIFAR100(root='/dataset/cifar100', train=True, download=False, transform=transform_train)
     val_dataset = datasets.CIFAR100(root='/dataset/cifar100', train=False, download=False, transform=transform_val)
 else:
@@ -98,16 +100,21 @@ else:
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    # 加载 Tiny ImageNet 数据集
-    data_dir = '/dataset/tiny-imagenet-200'  # 修改为 Tiny ImageNet 数据集的路径
+
+    data_dir = '/dataset/tiny-imagenet-200' 
     train_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'train'), transform=transform_train)
     val_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'val'), transform=transform_val)
-# 将训练数据集按 Dirichlet 分布划分为多个客户端数据集
+
+
 def split_dataset(train_dataset, num_clients, alpha, iid):
     if iid:
         return random_split(train_dataset, [len(train_dataset) // num_clients] * num_clients)
     else:
-        train_labels = np.array([s[1] for s in train_dataset.samples])
+        if hasattr(train_dataset, 'targets'):
+            train_labels = train_dataset.targets
+        else:
+            train_labels = np.array([s[1] for s in train_dataset.samples])
+
         class_indices = defaultdict(list)
         for idx, label in enumerate(train_labels):
             class_indices[label].append(idx)
@@ -125,11 +132,13 @@ def split_dataset(train_dataset, num_clients, alpha, iid):
         return [torch.utils.data.Subset(train_dataset, indices) for indices in client_indices]
 
 client_datasets = split_dataset(train_dataset, num_clients, alpha, iid)
-# 将训练数据集拆分为多个客户端数据集
-# client_datasets = random_split(train_dataset, [len(train_dataset) // num_clients] * num_clients)
-# 绘制数据分布图
+
+
 if flag:
-    labels = [train_dataset.samples[i][1] for i in range(len(train_dataset))]
+    if hasattr(train_dataset, 'targets'):
+        labels = train_dataset.targets
+    else:
+        labels = [train_dataset.samples[i][1] for i in range(len(train_dataset))]
     plt.figure(figsize=(20, 3))
     plt.hist([np.array(labels)[idx] for idx in [ds.indices for ds in client_datasets]], stacked=True,
              bins=np.arange(min(labels) - 0.5, max(labels) + 1.5, 1),
@@ -138,25 +147,33 @@ if flag:
     plt.legend()
     plt.savefig("data_distribution.png")
     plt.show()
-# 定义损失函数
+
+
 criterion = nn.CrossEntropyLoss()
 
-# 加载预训练的 MobileNetV3 Small 模型
-global_model = models.mobilenet_v3_small(pretrained=True)
 
-# 获取最后一层的输入特征数
-num_ftrs = global_model.classifier[3].in_features
+def get_model(model_name, dataset_name, device):
+    if model_name == "MobileNetV3":
+        model = models.mobilenet_v3_small(pretrained=True)
+        num_ftrs = model.classifier[3].in_features
+        if dataset_name == "CIFAR100":
+            model.classifier[3] = nn.Linear(num_ftrs, 100)
+        else:
+            model.classifier[3] = nn.Linear(num_ftrs, 200)
+    elif model_name == "ResNet18":
+        model = models.resnet18(pretrained=False)
+        num_ftrs = model.fc.in_features
+        if dataset_name == "CIFAR100":
+            model.fc = nn.Linear(num_ftrs, 100)
+        else:
+            model.fc = nn.Linear(num_ftrs, 200)
+    model = model.to(device)
+    return model
 
-# 替换最后一层，使其适应 200 个类别或 100 个类别
-if dataset_name == "CIFAR100":
-    global_model.classifier[3] = nn.Linear(num_ftrs, 100)
-else:
-    global_model.classifier[3] = nn.Linear(num_ftrs, 200)
 
-# 将整个模型转移到 GPU 上
-global_model = global_model.to(device)
+global_model = get_model(model_name, dataset_name, device)
 
-# 模拟每个客户端的训练
+
 def train_client(model, train_loader, eta_c, gamma_c, num_epochs=1):
     model.train()
     local_epoch_norm_max = 0.0
@@ -166,27 +183,24 @@ def train_client(model, train_loader, eta_c, gamma_c, num_epochs=1):
         running_corrects = 0
 
         for inputs, labels in train_loader:
-
             inputs = inputs.to(device)
             labels = labels.to(device)
 
-            # 前向传播
+         
             outputs = model(inputs)
             _, preds = torch.max(outputs, 1)
             loss = criterion(outputs, labels)
 
-            # 反向传播
+          
             model.zero_grad()
             loss.backward()
 
-            # 计算步长 h_{t,j}^i 并更新参数
+            
             state_dict = model.state_dict()
             for name, param in model.named_parameters():
                 if param.grad is not None:
-                    grad_norm = param.grad.norm(p=2)  # 使用 2 范数
+                    grad_norm = param.grad.norm(p=2)  
                     step_size = min(eta_c, (gamma_c * eta_c) / grad_norm)
-                    if step_size != 0.01:
-                        print(step_size)
                     state_dict[name] -= step_size * param.grad
             model.load_state_dict(state_dict)
             local_epoch_norm = torch.sqrt(sum(param.grad.norm(p=2) ** 2 for name, param in model.named_parameters()))
@@ -200,23 +214,22 @@ def train_client(model, train_loader, eta_c, gamma_c, num_epochs=1):
         epoch_acc = running_corrects.double() / len(train_loader.dataset)
         print(f'Client Epoch Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
 
-    # 返回更新后的模型
+    
     return model.state_dict(), local_epoch_norm_max, local_norm_sum/(num_epochs_per_round*(len(train_loader.dataset)/batch_size)), epoch_loss
 
-# 聚合客户端模型参数差异并更新全局模型
 def aggregate_models(global_model, client_models, bit, quantize):
     global_dict = global_model.state_dict()
 
-    # 初始化参数差异
+
     param_diffs = {name: torch.zeros_like(param).float() for name, param in global_dict.items()}
 
-    # 计算每个客户端模型参数与全局模型参数的差异
+   
     for client_model in client_models:
         client_dict = client_model.state_dict()
         for name in global_dict.keys():
             param_diffs[name] += global_dict[name] - client_dict[name]
 
-    # 量化参数差异（如果需要）
+    
     if quantize:
         q = Quantizer(bit)
         for name in global_dict.keys():
@@ -225,16 +238,14 @@ def aggregate_models(global_model, client_models, bit, quantize):
 
     param_diffs_norm = torch.sqrt(sum(torch.norm(param_diffs[name] / (num_clients), p=2)**2 for name in param_diffs.keys()))
     global_step_size = min(eta_s, (gamma_s * eta_s) / (param_diffs_norm/(num_clients*num_epochs_per_round)))
-    if global_step_size != 0.01:
-        print(f'Global Step Size: {global_step_size}')
-    # 计算平均参数差异并更新全局模型
+   
     for name in global_dict.keys():
         global_dict[name] = global_dict[name].float() - global_step_size * (param_diffs[name] / (num_clients * eta_c)).float()
 
     global_model.load_state_dict(global_dict)
     return global_model, param_diffs_norm, global_step_size
 
-# 验证模型
+
 def validate_model(model, val_loader):
     model.eval()
     running_loss = 0.0
@@ -257,7 +268,7 @@ def validate_model(model, val_loader):
     return val_acc
 
 
-trainloss_file = './trainloss' + '_MobileNetV3_small' + '.txt'
+trainloss_file = './trainloss' + '_'+model_name+'.txt'
 if (os.path.isfile(trainloss_file)):
     os.remove(trainloss_file)
 f_trainloss = open(trainloss_file, 'a')
@@ -277,13 +288,13 @@ for round in range(num_rounds):
         local_norm_max_all += local_norm_max
         local_norm_average_all += local_norm_average
         local_loss += loss
-    # 聚合客户端模型参数差异并更新全局模型
+
     global_model, global_gradient_norm,global_step_size = aggregate_models(global_model, client_models, bit, quantize)
 
-    # 每轮结束后进行验证
+
     val_acc = validate_model(global_model, DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, drop_last=True))
     print(f'Train Loss: {local_loss/num_clients} Valid Acc: {val_acc:.4f} Global Gradient Norm: {global_gradient_norm} \n'
           f'Local Norm Max: {local_norm_max_all/num_clients} Local Norm Average:{local_norm_average_all/num_clients}')
     f_trainloss.write(str(local_loss/num_clients) + "\t" + (f"{val_acc.item():.4f}") + "\t" + (f"{global_gradient_norm.item()}") + "\t"
-                      + (f"{local_norm_max_all.item()/num_clients}")+ "\t" +(f"{local_norm_average_all.item()/num_clients}")+"\t"+(f"{global_step_size.item()}")+ '\n')
+                      + (f"{local_norm_max_all.item()/num_clients}")+ "\t" +(f"{local_norm_average_all.item()/num_clients}")+"\t"+(f"{global_step_size}")+ '\n')
     f_trainloss.flush()
