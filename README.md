@@ -1,4 +1,4 @@
-# Federated Learning with PyTorch
+# FedQClip with PyTorch
 
 This repository contains a PyTorch implementation of a federated learning framework. The script simulates federated learning by training a model on multiple clients and aggregating the model updates on a central server.
 
