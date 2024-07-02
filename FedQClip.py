@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from collections import defaultdict
 
-# 模拟伪分布式训练
+
 num_clients = 4
 num_rounds = 100
 num_epochs_per_round = 5
